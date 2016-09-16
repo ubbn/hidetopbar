@@ -7,6 +7,7 @@
 *
 */
 
+const GLib = imports.gi.GLib;
 const Lang = imports.lang;
 const Mainloop = imports.mainloop;
 const Meta = imports.gi.Meta;
@@ -20,6 +21,9 @@ const Convenience = Me.imports.convenience;
 
 // A good compromise between reactivity and efficiency; to be tuned.
 const INTELLIHIDE_CHECK_INTERVAL = 100;
+
+const shell_version = parseFloat(
+    imports.misc.config.PACKAGE_VERSION.split('.').slice(0, 2).join('.'));
 
 const OverlapStatus = {
     UNDEFINED: -1,
@@ -43,7 +47,7 @@ const handledWindowTypes = [
  * A rough and ugly implementation of the intellihide behaviour.
  * Intallihide object: emit 'status-changed' signal when the overlap of windows
  * with the provided targetBoxClutter.ActorBox changes;
- * 
+ *
 */
 
 const intellihide = new Lang.Class({
@@ -65,12 +69,24 @@ const intellihide = new Lang.Class({
         // Set intellihide to use only the active window (or not)
         this._activeWindow = false;
 
-        // Main id of the timeout controlling timeout for updateDockVisibility function 
+        // Main id of the timeout controlling timeout for updateDockVisibility function
         // when windows are dragged around (move and resize)
         this._windowChangedTimeout = 0;
+        this._filterkeybindingId = 0;
 
         // Connect global signals
         this._signalsHandler.add (
+            // Listen for notification banners to appear or disappear
+            [
+                Main.messageTray.actor,
+                'show',
+                Lang.bind(this, this._checkOverlap)
+            ],
+            [
+                Main.messageTray.actor,
+                'hide',
+                Lang.bind(this, this._checkOverlap)
+            ],
             // Add timeout when window grab-operation begins and remove it when it ends.
             [
                 global.display,
@@ -82,16 +98,29 @@ const intellihide = new Lang.Class({
                 'grab-op-end',
                 Lang.bind(this, this._grabOpEnd)
             ],
-            // direct maximize/unmazimize are not included in grab-operations
+            // This intercept keybindings and let them execute (return false)
+            // The is a workaround to force an overlap check for those window
+            // position and size change which are not included in the other shell signals
+            // because triggered directly by this keybindings. Known examples are:
+            // 'move-to-corner-**', 'move-to-monitor-**'. The check is delayed to
+            // let the action be executed.
             [
                 global.window_manager,
-                'maximize', 
-                Lang.bind(this, this._checkOverlap )
-            ],
-            [
-                global.window_manager,
-                'unmaximize',
-                Lang.bind(this, this._checkOverlap )
+                'filter-keybinding',
+                Lang.bind(this, function(){
+                    // There's no need when not in normal mode (for instance in overview mode)
+                    if (Main.actionMode != Shell.ActionMode.NORMAL)
+                        return false;
+
+                    this._filterkeybindingId = Mainloop.timeout_add(INTELLIHIDE_CHECK_INTERVAL,
+                        Lang.bind(this, function(){
+                            this._filterkeybindingId = 0;
+                            this._checkOverlap();
+                            return GLib.SOURCE_REMOVE;
+                    }));
+
+                    return false;
+                  })
             ],
             // triggered for instance when the window list order changes,
             // included when the workspace is switched
@@ -107,6 +136,31 @@ const intellihide = new Lang.Class({
                 Lang.bind(this, this._checkOverlap )
             ]
         );
+        // direct maximize/unmazimize are not included in grab-operations
+        if (shell_version >= 3.18) {
+          this._signalsHandler.add (
+              [
+                global.window_manager,
+                'size-change',
+                Lang.bind(this, this._checkOverlap)
+              ]
+          );
+        } else {
+          // Since shell version 3.18, maximize and unmaximize do not exist
+          // any  longer. For recent versions, size-change serves this purpose.
+          this._signalsHandler.add (
+              [
+                global.window_manager,
+                'maximize',
+                Lang.bind(this, this._checkOverlap)
+              ],
+              [
+                global.window_manager,
+                'unmaximize',
+                Lang.bind(this, this._checkOverlap)
+              ]
+          );
+        }
 
     },
 
@@ -118,6 +172,10 @@ const intellihide = new Lang.Class({
         if(this._windowChangedTimeout>0)
             Mainloop.source_remove(this._windowChangedTimeout); // Just to be sure
         this._windowChangedTimeout=0;
+
+        if(this._filterkeybindingId>0)
+            Mainloop.source_remove(this._filterkeybindingId);
+        this._filterkeybindingId = 0;
     },
 
     enable: function() {
@@ -210,6 +268,17 @@ const intellihide = new Lang.Class({
             }
         }
 
+        // Check if notification banner overlaps
+        if(Main.messageTray.actor.visible) {
+            let rect = Main.messageTray.actor.get_allocation_box(),
+                test = ( rect.x1 < this._targetBox.x2) &&
+                       ( rect.x2 > this._targetBox.x1 ) &&
+                       ( rect.y1 < this._targetBox.y2 ) &&
+                       ( rect.y2 > this._targetBox.y1 );
+
+            if(test) overlaps = OverlapStatus.TRUE;
+        }
+
         if ( this._status !== overlaps ) {
             this._status = overlaps;
             this.emit('status-changed', this._status);
@@ -237,7 +306,7 @@ const intellihide = new Lang.Class({
         let currentApp = this._tracker.get_window_app(meta_win);
 
         if(this._activeWindow) {
-            if(this._focusApp != currentApp) {
+            if(wksp_index != currentWorkspace || this._focusApp != currentApp) {
                 return false;
             } else {
                 return true;
